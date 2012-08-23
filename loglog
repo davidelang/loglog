@@ -1,0 +1,1449 @@
+#!/usr/bin/perl
+
+use File::stat;
+use Time::localtime;
+
+# Note that Proc::Daemon, File::Tail and Net::Syslog are included inline. 
+
+$already_alive = `ps -ef | grep loglog | grep -v grep` + 0;
+if ($already_alive) { exit; }
+
+$mytimestamp = ctime(stat("/opt/disys/noarch/loglog")->mtime);
+
+$debug=0;
+
+Proc::Daemon::Init;
+my $continue = 1;
+$SIG{TERM} = sub { $continue = 0 };
+
+$log = new Net::Syslog(Facility=>'local6', Priority=>'info', SyslogHost=>'scribe');
+$host = `hostname -s`; chomp($host);
+$conf = "/opt/disys/etc/loglog/$host.conf";
+# print "config is $conf\n";
+
+my $timestamp = localtime(time);
+$log->send("$host loglog-status Startup (program timestamp is $mytimestamp)");
+
+if (! -e $conf) {
+   $log->send("$host loglog $timestamp Creating default logfile list");
+   open (C, ">$conf");
+   open (I, "find -L /opt/jboss -type f -mtime -1 -name '*.log' -print | grep -v 2012 |");
+   while (<I>) {
+      print C;
+   }
+   close I;
+   open (I, "find -L /opt/mule -type f -mtime -1 -name '*.log' -print | grep -v 2012 |");
+   while (<I>) {
+      print C;
+   }
+   close I;
+   open (I, "find -L /opt/di/system/jboss -type f -mtime -1 -name '*.log' -print | grep -v 2012 |");
+   while (<I>) {
+      print C;
+   }
+   close I;
+   close C;
+}
+
+open (I, $conf); 
+while (<I>) {
+   chomp;
+   push(@files, File::Tail->new(name=>"$_",debug=>$debug));
+}
+close I;
+
+my $rin='';
+$interval = 5 * 60; # 5 minutes
+$sent = 0; $nextreport = time + $interval;
+$log->send("$host : loglog-start");
+
+    while ($continue) {
+	$nfound=File::Tail::select(undef,undef,undef,60,@files);
+	unless ($nfound) {
+	    my @ints;
+	    foreach(@files) {
+		push(@ints,$_->interval);
+	    }
+	}
+	foreach (@files) {
+            if ($_->predict == 0) {
+               my $t = $_->read; chomp($t);
+               my $name = $_->{"input"}; 
+               my @parts = unpack("(A3500)*", $t); # Deal with really long lines
+               my $plen = scalar(@parts);
+               if ($plen == 1) { 
+                  $log->send("$host $name : $t");
+                  }
+               else {
+                  my $pc = 0;
+                  foreach $p (@parts) {
+                     $pc += 1;
+                     $log->send("$host $name ($sent-$pc/$plen) : $parts[$p]");
+                  }
+               }
+               $sent++; $sentbytes += length($t);
+            }
+	}
+        if (time > $nextreport) { 
+           $log->send("$host loglog-status sent $sent lines ($sentbytes bytes)");
+           $sent=0; $sentbytes=0; $nextreport += $interval;
+        }
+        $mynewtimestamp = ctime(stat("/opt/disys/noarch/loglog")->mtime);
+        if ($mynewtimestamp ne $mytimestamp) { # Modified! die, and watchdog will restart
+           $log->send("$host loglog-status program updated, aborting");
+           exit;
+        }
+    }
+
+package File::Tail;
+
+use strict;
+use vars qw($VERSION @ISA @EXPORT @EXPORT_OK);
+
+require Exporter;
+
+@ISA = qw(Exporter);
+# Items to export into callers namespace by default. Note: do not export
+# names by default without a very good reason. Use EXPORT_OK instead.
+# Do not simply export all your public functions/methods/constants.
+$VERSION = '0.99.3';
+
+
+# Preloaded methods go here.
+
+use FileHandle;
+#use IO::Seekable; # does not define SEEK_SET in 5005.02
+use File::stat;
+use Carp;
+use Time::HiRes qw ( time sleep ); #import hires microsecond timers
+
+sub SEEK_SET   () {0;}
+sub SEEK_CUR () {1;}
+sub SEEK_END   () {2;}
+
+
+sub interval {
+    my $object=shift @_;
+    if (@_) {
+	$object->{interval}=shift;
+	$object->{interval}=$object->{maxinterval} if 
+	    $object->{interval}>$object->{maxinterval};
+    }
+    $object->{interval};
+}
+
+sub logit {
+    my $object=shift;
+    my @call=caller(1);
+    print # STDERR 
+#	time()." ".
+	"\033[7m".
+	    $call[3]." ".$object->{"input"}." ".join("",@_).
+		"\033[0m".
+		    "\n"
+	if $object->debug;
+}
+
+sub adjustafter {
+    my $self=shift;
+    $self->{adjustafter}=shift if @_;
+    return $self->{adjustafter};
+}
+
+sub debug {
+    my $self=shift;
+    $self->{"debug"}=shift if @_;
+    return $self->{"debug"};
+}
+
+sub errmode {
+    my($self, $mode) = @_;
+    my($prev) = $self->{errormode};
+ 
+    if (@_ >= 2) {
+        ## Set the error mode.
+	defined $mode or $mode = '';
+	if (ref($mode) eq 'CODE') {
+	    $self->{errormode} = $mode;
+	} elsif (ref($mode) eq 'ARRAY') {
+	    unless (ref($mode->[0]) eq 'CODE') {
+		croak 'bad errmode: first item in list must be a code ref';
+		$mode = 'die';
+	    }
+	    $self->{errormode} = $mode;
+	} else {
+	    $self->{errormode} = lc $mode;
+	}
+    }
+     $prev;
+} 
+
+sub errmsg {
+    my($self, @errmsgs) = @_;
+    my($prev) = $self->{errormsg};
+ 
+    if (@_ > 0) {
+        $self->{errormsg} = join '', @errmsgs;
+    }
+ 
+    $prev;
+} # end sub errmsg
+ 
+ 
+sub error {
+    my($self, @errmsg) = @_;
+    my(
+       $errmsg,
+       $func,
+       $mode,
+       @args,
+       );
+ 
+    if (@_ >= 1) {
+        ## Put error message in the object.
+        $errmsg = join '', @errmsg;
+        $self->{"errormsg"} = $errmsg;
+ 
+        ## Do the error action as described by error mode.
+        $mode = $self->{"errormode"};
+        if (ref($mode) eq 'CODE') {
+            &$mode($errmsg);
+            return;
+        } elsif (ref($mode) eq 'ARRAY') {
+            ($func, @args) = @$mode;
+            &$func(@args);
+            return;
+        } elsif ($mode eq "return") {
+            return;
+	} elsif ($mode eq "warn") {
+	    carp $errmsg;
+        } else {  # die
+	    croak $errmsg;
+	}
+    } else {
+        return $self->{"errormsg"} ne '';
+    }
+} # end sub error
+
+
+sub copy {
+    my $self=shift;
+    $self->{copy}=shift if @_;
+    return $self->{copy};
+}
+
+sub tail {
+    my $self=shift;
+    $self->{"tail"}=shift if @_;
+    return $self->{"tail"};
+}
+
+sub reset_tail {
+    my $self=shift;
+    $self->{reset_tail}=shift if @_;
+    return $self->{reset_tail};
+}
+
+sub nowait {
+    my $self=shift;
+    $self->{nowait}=shift if @_;
+    return $self->{nowait};
+}
+
+sub method {
+    my $self=shift;
+    $self->{method}=shift if @_;
+    return $self->{method};
+}
+
+sub input {
+    my $self=shift;
+    $self->{input}=shift if @_;
+    return $self->{input};
+}
+
+sub maxinterval {
+    my $self=shift;
+    $self->{maxinterval}=shift if @_;
+    return $self->{maxinterval};
+}
+
+sub resetafter {
+    my $self=shift;
+    $self->{resetafter}=shift if @_;
+    return $self->{resetafter};
+}
+
+sub ignore_nonexistant {
+    my $self=shift;
+    $self->{ignore_nonexistant}=shift if @_;
+    return $self->{ignore_nonexistant};
+}
+
+sub name_changes {
+    my $self=shift;
+    $self->{name_changes_callback}=shift if @_;
+    return $self->{name_changes_callback};
+}
+
+sub TIEHANDLE {
+    my $ref=new(@_);
+}
+
+sub READLINE {
+    $_[0]->read();
+}
+
+sub PRINT {
+  $_[0]->error("PRINT makes no sense in File::Tail");
+}
+
+sub PRINTF {
+  $_[0]->error("PRINTF makes no sense in File::Tail");
+}
+
+sub READ {
+  $_[0]->error("READ not implemented in File::Tail -- use READLINE (<HANDLE>) instead");
+}
+
+sub GETC {
+  $_[0]->error("GETC not (yet) implemented in File::Tail -- use READLINE (<HANDLE>) instead");
+}
+
+sub DESTROY {
+  my($this) = $_[0];
+  close($this->{"handle"}) if (defined($this) && defined($this->{'handle'}));
+#  undef $_[0];
+  return;
+}
+
+sub CLOSE {
+    &DESTROY(@_);
+}
+
+sub new {
+    my ($pkg)=shift @_;
+    $pkg=ref($pkg) || $pkg;
+    unless ($pkg) {
+	$pkg="File::Tail";
+    } 
+    my %params;
+    if ($#_ == 0)  {
+	$params{"name"}=$_[0];
+    } else {
+	if (($#_ % 2) != 1) {
+	    croak "Odd number of parameters for new";
+	    return;
+	}
+	%params=@_;
+    }
+    my $object = {};
+    bless $object,$pkg;
+    unless (defined($params{'name'})) {
+	croak "No file name given. Pass filename as \"name\" parameter";
+	return;
+    }
+    $object->input($params{'name'});
+    $object->copy($params{'cname'});
+    $object->method($params{'method'} || "tail");
+    $object->{buffer}="";
+    $object->maxinterval($params{'maxinterval'} || 60);
+    $object->interval($params{'interval'} || 10);
+    $object->adjustafter($params{'adjustafter'} || 10);
+    $object->errmode($params{'errmode'} || "die");
+    $object->resetafter($params{'resetafter'} || 
+			 ($object->maxinterval*$object->adjustafter));
+    $object->{"debug"}=($params{'debug'} || 0);
+    $object->{"tail"}=($params{'tail'} || 0);
+    $object->{"nowait"}=($params{'nowait'} || 0);
+    $object->{"maxbuf"}=($params{'maxbuf'} || 16384);
+    $object->{"name_changes_callback"}=($params{'name_changes'} || undef);
+    if (defined $params{'reset_tail'}) {
+        $object->{"reset_tail"} = $params{'reset_tail'};
+    } else {
+        $object->{"reset_tail"} =  -1;
+    }
+    $object->{'ignore_nonexistant'}=($params{'ignore_nonexistant'} || 0);
+    $object->{"lastread"}=0;
+    $object->{"sleepcount"}=0;
+    $object->{"lastcheck"}=0;
+    $object->{"lastreset"}=0;
+    $object->{"nextcheck"}=time();
+    if ($object->{"method"} eq "tail") {
+	$object->reset_pointers;
+    }
+#    $object->{curpos}=0;        # ADDED 25May01: undef warnings when
+#    $object->{endpos}=0;        #   starting up on a nonexistant file
+    return $object;
+}
+
+# Sets position in file when first opened or after that when reset:
+# Sets {endpos} and {curpos} for current {handle} based on {tail}.
+# Sets {tail} to value of {reset_tail}; effect is that first call 
+# uses {tail} and subsequent calls use {reset_tail}.
+sub position {
+    my $object=shift;
+    $object->{"endpos"}=sysseek($object->{handle},0,SEEK_END);
+    unless ($object->{"tail"}) {
+	$object->{endpos}=$object->{curpos}=
+	    sysseek($object->{handle},0,SEEK_END);
+    } elsif ($object->{"tail"}<0) {
+	$object->{endpos}=sysseek($object->{handle},0,SEEK_END);
+	$object->{curpos}=sysseek($object->{handle},0,SEEK_SET);
+    } else {
+	my $crs=0;
+	my $maxlen=sysseek($object->{handle},0,SEEK_END);
+	while ($crs<$object->{"tail"}+1) {
+	    my $avlen=length($object->{"buffer"})/($crs+1);
+	    $avlen=80 unless $avlen;
+	    my $calclen=$avlen*$object->{"tail"};
+	    $calclen+=1024 if $calclen<=length($object->{"buffer"});
+	    $calclen=$maxlen if $calclen>$maxlen;
+	    $object->{curpos}=sysseek($object->{handle},-$calclen,SEEK_END);
+	    sysread($object->{handle},$object->{"buffer"},
+		    $calclen);
+	    $object->{curpos}=sysseek($object->{handle},0,SEEK_CUR);
+	    $crs=$object->{"buffer"}=~tr/\n//;
+	    last if ($calclen>=$maxlen);
+	}
+	$object->{curpos}=sysseek($object->{handle},0,SEEK_CUR);
+	$object->{endpos}=sysseek($object->{handle},0,SEEK_END);
+	if ($crs>$object->{"tail"}) {
+	    my $toskip=$crs-$object->{"tail"};
+	    my $pos;
+	    $pos=index($object->{"buffer"},"\n");
+	    while (--$toskip) {
+		$pos=index($object->{"buffer"},"\n",$pos+1);
+	    }
+	    $object->{"buffer"}=substr($object->{"buffer"},$pos+1);
+	}
+    }
+    $object->{"tail"}=$object->{"reset_tail"};
+}
+
+# Tries to open or reopen the file; failure is an error unless 
+# {ignore_nonexistant} is set. 
+# 
+# For a new file (ie, first time opened) just does some book-keeping 
+# and calls position for initial position setup.  Otherwise does some 
+# checks whether file has been replaced, and if so changes to the new 
+# file.  (Calls position for reset setup).
+#
+# Always updates {lastreset} to current time.
+#
+sub reset_pointers {
+    my $object=shift @_;
+    $object->{lastreset} = time();
+
+    my $st;
+
+    my $oldhandle=$object->{handle};
+    my $newhandle=FileHandle->new;
+
+    my $newname;
+    if ($oldhandle && $$object{'name_changes_callback'}) {
+	$newname=$$object{'name_changes_callback'}();
+    } else {
+	$newname=$object->input;
+    }
+
+    unless (open($newhandle,"<$newname")) {
+	if ($object->{'ignore_nonexistant'}) {
+         # If we have an oldhandle, leave endpos and curpos to what they 
+         # were, since oldhandle will still be the "current" handle elsewhere, 
+         # eg, checkpending.  This also allows tailing a file which is removed 
+         # but still being written to.
+            if (!$oldhandle) {
+                $object->{'endpos'}=0;
+                $object->{'curpos'}=0;
+            }
+	    return;
+	}
+	$object->error("Error opening ".$object->input.": $!");
+	$object->{'endpos'}=0 unless defined($object->{'endpos'});
+	$object->{'curpos'}=0 unless defined($object->{'curpos'});
+	return;
+    }
+    binmode($newhandle);
+    
+    if (defined($oldhandle)) {
+	# If file has not been changed since last OK read do not do anything
+	$st=stat($newhandle);
+	# lastread uses fractional time, stat doesn't. This can cause false
+        # negatives. 
+        # If the file was changed the same second as it was last read,
+        # we only reopen it if it's length has changed. The alternative is that
+        # sometimes, files would be reopened needlessly, and with reset_tail
+	# set to -1, we would see the whole file again.
+	# Of course, if the file was removed the same second as when it was
+        # last read, and replaced (within that second) with a file of equal
+        # length, we're out of luck. I don't see how to fix this.
+	if ($st->mtime<=int($object->{'lastread'})) {
+	    if ($st->size==$object->{"curpos"}) {
+		$object->{lastread} = $st->mtime; 
+		return;
+	    } else { 
+		# will continue further to reset
+	    }
+	} else {
+	}
+	$object->{handle}=$newhandle;
+	$object->position;
+	$object->{lastread} = $st->mtime;
+	close($oldhandle);
+    } else {                  # This is the first time we are opening this file
+	$st=stat($newhandle);
+	$object->{handle}=$newhandle;
+	$object->position;
+	$object->{lastread}=$st->mtime; # for better estimate on initial read
+    }
+    
+}
+
+
+sub checkpending {
+   my $object=shift @_;
+
+   my $old_lastcheck = $object->{lastcheck};
+   $object->{"lastcheck"}=time;
+   unless ($object->{handle}) {
+       $object->reset_pointers;
+       unless ($object->{handle}) { # This try did not open the file either
+	   return 0;
+       }
+   }
+   
+   $object->{"endpos"}=sysseek($object->{handle},0,SEEK_END);
+   if ($object->{"endpos"}<$object->{curpos}) {  # file was truncated
+       $object->position;
+   } elsif (($object->{curpos}==$object->{"endpos"}) 
+	       && (time()-$object->{lastread})>$object->{'resetafter'}) {
+       $object->reset_pointers;
+       $object->{"endpos"}=sysseek($object->{handle},0,SEEK_END);
+   }
+
+   if ($object->{"endpos"}-$object->{curpos}) {
+       sysseek($object->{handle},$object->{curpos},SEEK_SET);
+       readin($object,$object->{"endpos"}-$object->{curpos});
+   }
+   return ($object->{"endpos"}-$object->{curpos});
+}
+
+sub predict {
+    my $object=shift;
+    my $crs=$object->{"buffer"}=~tr/\n//; # Count newlines in buffer 
+    my @call=caller(1);
+    return 0 if $crs;
+    my $ttw=$object->{"nextcheck"}-time();
+    return $ttw if $ttw>0;
+    if (my $len=$object->checkpending) {
+	readin($object,$len);
+	return 0;
+    }
+    if ($object->{"sleepcount"}>$object->adjustafter) {
+	$object->{"sleepcount"}=0;
+	$object->interval($object->interval*10);
+    }
+    $object->{"sleepcount"}++;
+    $object->{"nextcheck"}=time()+$object->interval;
+    return ($object->interval);
+}
+
+sub bitprint {
+    return "undef" unless defined($_[0]);
+    return unpack("b*",$_[0]);
+}
+
+sub select {
+    my $object=shift @_  if ref($_[0]);
+    my ($timeout,@fds)=splice(@_,3);
+    $object=$fds[0] unless defined($object);
+    my ($savein,$saveout,$saveerr)=@_;
+    my ($minpred,$mustreturn);
+    if (defined($timeout)) {
+	$minpred=$timeout;
+	$mustreturn=time()+$timeout;
+    } else {
+	$minpred=$fds[0]->predict;
+    }
+    foreach (@fds) {
+	my $val=$_->predict;
+	$minpred=$val if $minpred>$val;
+    }
+    my ($nfound,$timeleft);
+    my @retarr;
+    while (defined($timeout)?(!$nfound && (time()<$mustreturn)):!$nfound) {
+# Restore bitmaps in case we called select before
+	splice(@_,0,3,$savein,$saveout,$saveerr);
+
+
+	($nfound,$timeleft)=select($_[0],$_[1],$_[2],$minpred);
+
+
+	if (defined($timeout)) {
+	    $minpred=$timeout;
+	} else {
+	    $minpred=$fds[0]->predict;
+	}
+	undef @retarr;
+	foreach (@fds) {
+	    my $val=$_->predict;
+	    $nfound++ unless $val;
+	    $minpred=$val if $minpred>$val;
+	    push(@retarr,$_) unless $val;
+	}
+    }
+    if (wantarray) {
+	return ($nfound,$timeleft,@retarr);
+    } else {
+	return $nfound;
+    }
+}
+
+sub readin {
+    my $crs;
+    my ($object,$len)=@_;
+    if (length($object->{"buffer"})) {
+	# this means the file was reset AND a tail -n was active
+	$crs=$object->{"buffer"}=~tr/\n//; # Count newlines in buffer 
+	return $crs if $crs;
+    }
+    $len=$object->{"maxbuf"} if ($len>$object->{"maxbuf"});
+    my $nlen=$len;
+    while ($nlen>0) {
+	$len=sysread($object->{handle},$object->{"buffer"},
+		     $nlen,length($object->{"buffer"}));
+	return 0 if $len==0; # Some busy filesystems return 0 sometimes, 
+                             # and never give anything more from then on if 
+                             # you don't give them time to rest. This return 
+                             # allows File::Tail to use the usual exponential 
+                             # backoff.
+	$nlen=$nlen-$len;
+    }
+    $object->{curpos}=sysseek($object->{handle},0,SEEK_CUR);
+    
+    $crs=$object->{"buffer"}=~tr/\n//;
+    
+    if ($crs) {
+	my $tmp=time;
+	$object->{lastread}=$tmp if $object->{lastread}>$tmp; #???
+	$object->interval(($tmp-($object->{lastread}))/$crs);
+	$object->{lastread}=$tmp;
+    }
+    return ($crs);
+}
+
+sub read {
+    my $object=shift @_;
+    my $len;
+    my $pending=$object->{"endpos"}-$object->{"curpos"};
+    my $crs=$object->{"buffer"}=~m/\n/;
+    while (!$pending && !$crs) {
+	$object->{"sleepcount"}=0;
+	while ($object->predict) {
+	    if ($object->nowait) {
+		if (wantarray) {
+		    return ();
+		} else {
+		    return "";
+		}
+	    }
+	    sleep($object->interval) if ($object->interval>0);
+	}
+	$pending=$object->{"endpos"}-$object->{"curpos"};
+	$crs=$object->{"buffer"}=~m/\n/;
+    }
+    
+    if (!length($object->{"buffer"}) || index($object->{"buffer"},"\n")<0) {
+	readin($object,$pending);
+    }
+    unless (wantarray) {
+	my $str=substr($object->{"buffer"},0,
+		       1+index($object->{"buffer"},"\n"));
+	$object->{"buffer"}=substr($object->{"buffer"},
+				   1+index($object->{"buffer"},"\n"));
+	return $str;
+    } else {
+	my @str;
+	while (index($object->{"buffer"},"\n")>-1) {
+	    push(@str,substr($object->{"buffer"},0,
+			     1+index($object->{"buffer"},"\n")));
+	    $object->{"buffer"}=substr($object->{"buffer"},
+				       1+index($object->{"buffer"},"\n"));
+
+	}
+	return @str;
+    }
+}
+
+1;
+
+package Net::Syslog;
+
+use vars qw($VERSION);
+#use warnings;
+#use strict;
+use IO::Socket;
+use Sys::Hostname;
+
+$VERSION = '0.04';
+
+# Preloaded methods go here.
+
+my %syslog_priorities = (
+    emerg         => 0,
+    emergency     => 0,
+    alert         => 1,
+    crit          => 2,
+    critical      => 2,
+    err           => 3,
+    error         => 3,
+    warning       => 4,
+    notice        => 5,
+    info          => 6,
+    informational => 6,
+    debug         => 7
+);
+
+my %syslog_facilities = (
+    kern      => 0,
+    kernel    => 0,
+    user      => 1,
+    mail      => 2,
+    daemon    => 3,
+    system    => 3,
+    auth      => 4,
+    syslog    => 5,
+    internal  => 5,
+    lpr       => 6,
+    printer   => 6,
+    news      => 7,
+    uucp      => 8,
+    cron      => 9,
+    clock     => 9,
+    authpriv  => 10,
+    security2 => 10,
+    ftp       => 11,
+    FTP       => 11,
+    NTP       => 11,
+    audit     => 13,
+    alert     => 14,
+    clock2    => 15,
+    local0    => 16,
+    local1    => 17,
+    local2    => 18,
+    local3    => 19,
+    local4    => 20,
+    local5    => 21,
+    local6    => 22,
+    local7    => 23,
+);
+
+my @month = qw{Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec};
+
+sub new {
+    my $class = shift;
+    my $name  = $0;
+    if ( $name =~ /.+\/(.+)/ ) {
+        $name = $1;
+    }
+    my $self = {
+        Name       => $name,
+        Facility   => 'local5',
+        Priority   => 'error',
+        Pid        => $$,
+        SyslogPort => 514,
+        SyslogHost => '127.0.0.1'
+    };
+    bless $self, $class;
+    my %par = @_;
+    foreach ( keys %par ) {
+        $self->{$_} = $par{$_};
+    }
+    return $self;
+}
+
+sub send {
+    my $self  = shift;
+    my $msg   = shift;
+    my %par   = @_;
+    my %local = %$self;
+    foreach ( keys %par ) {
+        $local{$_} = $par{$_};
+    }
+
+    my $pid = ( $local{Pid} =~ /^\d+$/ ) ? "\[$local{Pid}\]" : "";
+    my $facility_i = $syslog_facilities{ $local{Facility} } || 21;
+    my $priority_i = $syslog_priorities{ $local{Priority} } || 3;
+
+    my $d = ( ( $facility_i << 3 ) | ($priority_i) );
+
+    my $host = inet_ntoa( ( gethostbyname(hostname) )[4] );
+    my @time = localtime();
+    my $ts =
+        $month[ $time[4] ] . " "
+      . ( ( $time[3] < 10 ) ? ( " " . $time[3] ) : $time[3] ) . " "
+      . ( ( $time[2] < 10 ) ? ( "0" . $time[2] ) : $time[2] ) . ":"
+      . ( ( $time[1] < 10 ) ? ( "0" . $time[1] ) : $time[1] ) . ":"
+      . ( ( $time[0] < 10 ) ? ( "0" . $time[0] ) : $time[0] );
+    my $message = '';
+
+    if ( $local{rfc3164} ) {
+        $message = "<$d>$ts $host $local{Name}$pid: $msg";
+    }
+    else {
+        $message = "<$d>$local{Name}$pid: $msg";
+    }
+
+    my $sock = new IO::Socket::INET(
+        PeerAddr => $local{SyslogHost},
+        PeerPort => $local{SyslogPort},
+        Proto    => 'udp'
+    );
+    die "Socket could not be created : $!\n" unless $sock;
+    print $sock $message;
+    $sock->close();
+}
+
+# Autoload methods go after =cut, and are processed by the autosplit program.
+
+1;
+
+################################################################################
+##  File:
+##      Daemon.pm
+##  Authors:
+##      Earl Hood         earl@earlhood.com
+##      Detlef Pilzecker  deti@cpan.org
+##  Description:
+##      Run Perl program(s) as a daemon process, see docu in the Daemon.pod file
+################################################################################
+##  Copyright (C) 1997-2011 by Earl Hood and Detlef Pilzecker.
+##
+##  All rights reserved.
+##
+##  This module is free software. It may be used, redistributed and/or modified
+##      under the same terms as Perl itself.
+################################################################################
+
+
+package Proc::Daemon;
+
+use strict;
+use POSIX();
+
+$Proc::Daemon::VERSION = '0.14';
+
+
+################################################################################
+# Create the Daemon object:
+# my $daemon = Proc::Daemon->new( [ %Daemon_Settings ] )
+#
+#   %Daemon_Settings are hash key=>values and can be:
+#     work_dir     => '/working/daemon/directory'   -> defaults to '/'
+#     setuid       => 12345                         -> defaults to <undef>
+#     child_STDIN  => '/path/to/daemon/STDIN.file'  -> defautls to '</dev/null'
+#     child_STDOUT => '/path/to/daemon/STDOUT.file' -> defaults to '+>/dev/null'
+#     child_STDERR => '/path/to/daemon/STDERR.file' -> defaults to '+>/dev/null'
+#     dont_close_fh => [ 'main::DATA', 'PackageName::DATA', 'STDOUT', ... ]
+#       -> arrayref with file handles you do not want to be closed in the daemon.
+#     dont_close_fd => [ 5, 8, ... ]                -> arrayref with file
+#       descriptors you do not want to be closed in the daemon.
+#     pid_file =>     '/path/to/pid/file.txt'       -> defaults to
+#       undef (= write no file).
+#     exec_command => 'perl /home/script.pl'        -> execute a system command
+#       via Perls *exec PROGRAM* at the end of the Init routine and never return.
+#       Must be an arrayref if you want to create several daemons at once.
+#
+# Returns: the blessed object.
+################################################################################
+sub new {
+    my ( $class, %args ) = @_;
+
+    my $self = \%args;
+    bless( $self, $class );
+
+    $self->{memory} = {};
+
+    return $self;
+}
+
+
+################################################################################
+# Become a daemon:
+# $daemon->Init
+#
+# or, for more daemons with other settings in the same script:
+# Use a hash as below. The argument must (!) now be a hashref: {...}
+# even if you don't modify the initial settings (=> use empty hashref).
+# $daemon->Init( { [ %Daemon_Settings ] } )
+#
+# or, if no Daemon->new() object was created and for backward compatibility:
+# Proc::Daemon::Init( [ { %Daemon_Settings } ] )
+#   In this case the argument must be <undef> or a hashref!
+#
+# %Daemon_Settings see &new.
+#
+# Returns to the parent:
+#   - nothing (parent does exit) if the context is looking for no return value.
+#   - the PID(s) of the daemon(s) created.
+# Returns to the child (daemon):
+#   its PID (= 0) | never returns if used with 'exec_command'.
+################################################################################
+sub Init {
+    my Proc::Daemon $self = shift;
+    my $settings_ref = shift;
+
+
+    # Check if $self has been blessed into the package, otherwise do it now.
+    unless ( ref( $self ) && eval{ $self->isa( 'Proc::Daemon' ) } ) {
+        $self = ref( $self ) eq 'HASH' ? Proc::Daemon->new( %$self ) : Proc::Daemon->new();
+    }
+    # If $daemon->Init is used again in the same script,
+    # update to the new arguments.
+    elsif ( ref( $settings_ref ) eq 'HASH' ) {
+        map { $self->{ $_ } = $$settings_ref{ $_ } } keys %$settings_ref;
+    }
+
+
+    # Open a filehandle to an anonymous temporary pid file. If this is not
+    # possible (some environments do not allow all users to use anonymous
+    # temporary files), use the pid_file(s) to retrieve the PIDs for the parent.
+    my $FH_MEMORY;
+    unless ( open( $FH_MEMORY, "+>", undef ) || $self->{pid_file} ) {
+        die "Can not <open> anonymous temporary pidfile ('$!'), therefore you must add 'pid_file' as an Init() argument, e.g. to: '/tmp/proc_daemon_pids'";
+    }
+
+
+    # Get the file descriptors the user does not want to close.
+    my %dont_close_fd;
+    if ( defined $self->{dont_close_fd} ) {
+        die "The argument 'dont_close_fd' must be arrayref!"
+            if ref( $self->{dont_close_fd} ) ne 'ARRAY';
+        foreach ( @{ $self->{dont_close_fd} } ) {
+            die "All entries in 'dont_close_fd' must be numeric ('$_')!" if $_ =~ /\D/;
+            $dont_close_fd{ $_ } = 1;
+        }
+    }
+    # Get the file descriptors of the handles the user does not want to close.
+    if ( defined $self->{dont_close_fh} ) {
+        die "The argument 'dont_close_fh' must be arrayref!"
+            if ref( $self->{dont_close_fh} ) ne 'ARRAY';
+        foreach ( @{ $self->{dont_close_fh} } ) {
+            if ( defined ( my $fn = fileno $_ ) ) {
+                $dont_close_fd{ $fn } = 1;
+            }
+        }
+    }
+
+
+    # If system commands are to be executed, put them in a list.
+    my @exec_command = ref( $self->{exec_command} ) eq 'ARRAY' ? @{ $self->{exec_command} } : ( $self->{exec_command} );
+    $#exec_command = 0 if $#exec_command < 0;
+
+
+    # Create a daemon for every system command.
+    foreach my $exec_command ( @exec_command ) {
+        # The first parent is running here.
+
+
+        # Using this subroutine or loop multiple times we must modify the filenames:
+        # 'child_STDIN', 'child_STDOUT', 'child_STDERR' and 'pid_file' for every
+        # daemon (a higher number will be appended to the filenames).
+        $self->adjust_settings();
+
+
+        # First fork.
+        my $pid = Fork();
+        if ( defined $pid && $pid == 0 ) {
+            # The first child runs here.
+
+
+            # Set the new working directory.
+            die "Can't <chdir> to $self->{work_dir}: $!" unless chdir $self->{work_dir};
+
+            # Clear the file creation mask.
+            umask 0;
+
+            # Detach the child from the terminal (no controlling tty), make it the
+            # session-leader and the process-group-leader of a new process group.
+            die "Cannot detach from controlling terminal" if POSIX::setsid() < 0;
+
+            # "Is ignoring SIGHUP necessary?
+            #
+            # It's often suggested that the SIGHUP signal should be ignored before
+            # the second fork to avoid premature termination of the process. The
+            # reason is that when the first child terminates, all processes, e.g.
+            # the second child, in the orphaned group will be sent a SIGHUP.
+            #
+            # 'However, as part of the session management system, there are exactly
+            # two cases where SIGHUP is sent on the death of a process:
+            #
+            #   1) When the process that dies is the session leader of a session that
+            #      is attached to a terminal device, SIGHUP is sent to all processes
+            #      in the foreground process group of that terminal device.
+            #   2) When the death of a process causes a process group to become
+            #      orphaned, and one or more processes in the orphaned group are
+            #      stopped, then SIGHUP and SIGCONT are sent to all members of the
+            #      orphaned group.' [2]
+            #
+            # The first case can be ignored since the child is guaranteed not to have
+            # a controlling terminal. The second case isn't so easy to dismiss.
+            # The process group is orphaned when the first child terminates and
+            # POSIX.1 requires that every STOPPED process in an orphaned process
+            # group be sent a SIGHUP signal followed by a SIGCONT signal. Since the
+            # second child is not STOPPED though, we can safely forego ignoring the
+            # SIGHUP signal. In any case, there are no ill-effects if it is ignored."
+            # Source: http://code.activestate.com/recipes/278731/
+            #
+           # local $SIG{'HUP'} = 'IGNORE';
+
+            # Second fork.
+            # This second fork is not absolutely necessary, it is more a precaution.
+            # 1. Prevent possibility of reacquiring a controlling terminal.
+            # Without this fork the daemon would remain a session-leader. In
+            # this case there is a potential possibility that the process could
+            # reacquire a controlling terminal. E.g. if it opens a terminal device,
+            # without using the O_NOCTTY flag. In Perl this is normally the case
+            # when you use <open> on this kind of device, instead of <sysopen>
+            # with the O_NOCTTY flag set.
+            # Note: Because of the second fork the daemon will not be a session-
+            # leader and therefore Signals will not be send to other members of
+            # his process group. If you need the functionality of a session-leader
+            # you may want to call POSIX::setsid() manually on your daemon.
+            # 2. Detach the daemon completely from the parent.
+            # The double-fork prevents the daemon from becoming a zombie. It is
+            # needed in this module because the grandparent process can continue.
+            # Without the second fork and if a child exits before the parent
+            # and you forget to call <wait> in the parent you will get a zombie
+            # until the parent also terminates. Using the second fork we can be
+            # sure that the parent of the daemon is finished near by or before
+            # the daemon exits.
+            $pid = Fork();
+            if ( defined $pid && $pid == 0 ) {
+                # Here the second child is running.
+
+
+                # Close all file handles and descriptors the user does not want
+                # to preserve.
+                my $hc_fd; # highest closed file descriptor
+                close $FH_MEMORY;
+                foreach ( 0 .. OpenMax() ) {
+                    unless ( $dont_close_fd{ $_ } ) {
+                        if    ( $_ == 0 ) { close STDIN  }
+                        elsif ( $_ == 1 ) { close STDOUT }
+                        elsif ( $_ == 2 ) { close STDERR }
+                        else { $hc_fd = $_ if POSIX::close( $_ ) }
+                    }
+                }
+
+                # Sets the real user identifier and the effective user
+                # identifier for the daemon process before opening files.
+                POSIX::setuid( $self->{setuid} ) if defined $self->{setuid};
+
+                # Reopen STDIN, STDOUT and STDERR to 'child_STD...'-path or to
+                # /dev/null. Data written on a null special file is discarded.
+                # Reads from the null special file always return end of file.
+                open( STDIN,  $self->{child_STDIN}  || "</dev/null" )  unless $dont_close_fd{ 0 };
+                open( STDOUT, $self->{child_STDOUT} || "+>/dev/null" ) unless $dont_close_fd{ 1 };
+                open( STDERR, $self->{child_STDERR} || "+>/dev/null" ) unless $dont_close_fd{ 2 };
+
+                # Since <POSIX::close(FD)> is in some cases "secretly" closing
+                # file descriptors without telling it to perl, we need to
+                # re<open> and <CORE::close(FH)> as many files as we closed with
+                # <POSIX::close(FD)>. Otherwise it can happen (especially with
+                # FH opened by __DATA__ or __END__) that there will be two perl
+                # handles associated with one file, what can cause some
+                # confusion.   :-)
+                # see: http://rt.perl.org/rt3/Ticket/Display.html?id=72526
+                if ( $hc_fd ) {
+                    my @fh;
+                    foreach ( 3 .. $hc_fd ) { open $fh[ $_ ], "</dev/null" }
+                    # Perl will try to close all handles when @fh leaves scope
+                    # here, but the rude ones will sacrifice themselves to avoid
+                    # potential damage later.
+                }
+
+
+                # Execute a system command and never return.
+                if ( $exec_command ) {
+                    exec $exec_command;
+                    exit; # Not a real exit, but needed since Perl warns you if
+                    # there is no statement like <die>, <warn>, or <exit>
+                    # following <exec>. The <exec> function executes a system
+                    # command and never returns.
+                }
+
+
+                # Return the childs own PID (= 0)
+                return $pid;
+            }
+
+
+            # First child (= second parent) runs here.
+
+
+            # Print the PID of the second child into ...
+            $pid ||= '';
+            # ... the anonymous temporary pid file.
+            if ( $FH_MEMORY ) {
+                print $FH_MEMORY "$pid\n";
+                close $FH_MEMORY;
+            }
+            # ... the real 'pid_file'.
+            if ( $self->{pid_file} ) {
+                open( my $FH_PIDFILE, "+>", $self->{pid_file} ) ||
+                    die "Can not open pidfile (pid_file => '$self->{pid_file}'): $!";
+                print $FH_PIDFILE $pid;
+                close $FH_PIDFILE;
+            }
+
+
+            # Don't <wait> for the second child to exit,
+            # even if we don't have a value in $exec_command.
+            # The second child will become orphan by <exit> here, but then it
+            # will be adopted by init(8), which automatically performs a <wait>
+            # to remove the zombie when the child exits.
+
+            exit;
+        }
+
+
+        # Only first parent runs here.
+
+
+        # A child that terminates, but has not been waited for becomes
+        # a zombie. So we wait for the first child to exit.
+        waitpid( $pid, 0 );
+    }
+
+
+    # Only first parent runs here.
+
+
+    # Exit if the context is looking for no value (void context).
+    exit 0 unless defined wantarray;
+
+    # Get the daemon PIDs out of the anonymous temporary pid file
+    # or out of the real pid-file(s)
+    my @pid;
+    if ( $FH_MEMORY ) {
+        seek( $FH_MEMORY, 0, 0 );
+        @pid = map { chomp $_; $_ eq '' ? undef : $_ } <$FH_MEMORY>;
+        close $FH_MEMORY;
+    }
+    elsif ( $self->{memory}{pid_file} ) {
+        foreach ( keys %{ $self->{memory}{pid_file} } ) {
+            open( $FH_MEMORY, "<", $_ ) || die "Can not open pid_file '<$_': $!";
+            push( @pid, <$FH_MEMORY> );
+            close $FH_MEMORY;
+        }
+    }
+
+    # Return the daemon PIDs (from second child/ren) to the first parent.
+    return ( wantarray ? @pid : $pid[0] );
+}
+# For backward capability:
+*init = \&Init;
+
+
+################################################################################
+# Set some defaults and adjust some settings.
+# Args: ( $self )
+# Returns: nothing
+################################################################################
+sub adjust_settings {
+    my Proc::Daemon $self = shift;
+
+    # Set default 'work_dir' if needed.
+    $self->{work_dir} ||= '/';
+
+    $self->fix_filename( 'child_STDIN',  1 ) if $self->{child_STDIN};
+
+    $self->fix_filename( 'child_STDOUT', 1 ) if $self->{child_STDOUT};
+
+    $self->fix_filename( 'child_STDERR', 1 ) if $self->{child_STDERR};
+
+    # Check 'pid_file's name
+    if ( $self->{pid_file} ) {
+        die "Pidfile (pid_file => '$self->{pid_file}') can not be only a number. I must be able to distinguish it from a PID number in &get_pid('...')." if $self->{pid_file} =~ /^\d+$/;
+
+        $self->fix_filename( 'pid_file' );
+    }
+
+    return;
+}
+
+
+################################################################################
+# - If the keys value is only a filename add the path of 'work_dir'.
+# - If we have already set a file for this key with the same "path/name",
+#   add a number to the file.
+# Args: ( $self, $key, $extract_mode )
+#   key: one of 'child_STDIN', 'child_STDOUT', 'child_STDERR', 'pid_file'
+#   extract_mode: true = separate <open> MODE form filename before checking
+#                 path/filename; false = no MODE to check
+# Returns: nothing
+################################################################################
+sub fix_filename {
+    my Proc::Daemon $self = shift;
+    my $key  = shift;
+    my $var  = $self->{ $key };
+    my $mode = ( shift ) ? ( $var =~ s/^([\+\<\>\-\|]+)// ? $1 : ( $key eq 'child_STDIN' ? '<' : '+>' ) ) : '';
+
+    # add path to filename
+    if ( $var =~ s/^\.\/// || $var !~ /\// ) {
+        $var = $self->{work_dir} =~ /\/$/ ?
+            $self->{work_dir} . $var : $self->{work_dir} . '/' . $var;
+    }
+
+    # If the file was already in use, modify it with '_number':
+    # filename_X | filename_X.ext
+    if ( $self->{memory}{ $key }{ $var } ) {
+        $var =~ s/([^\/]+)$//;
+        my @i = split( /\./, $1 );
+        my $j = $#i ? $#i - 1 : 0;
+
+        $self->{memory}{ "$key\_num" } ||= 0;
+        $i[ $j ] =~ s/_$self->{memory}{ "$key\_num" }$//;
+        $self->{memory}{ "$key\_num" }++;
+        $i[ $j ] .= '_' . $self->{memory}{ "$key\_num" };
+        $var .= join( '.', @i );
+    }
+
+    $self->{memory}{ $key }{ $var } = 1;
+    $self->{ $key } = $mode . $var;
+
+    return;
+}
+
+
+################################################################################
+# Fork(): Retries to fork over 30 seconds if possible to fork at all and
+#   if necessary.
+# Returns the child PID to the parent process and 0 to the child process.
+#   If the fork is unsuccessful it C<warn>s and returns C<undef>.
+################################################################################
+sub Fork {
+    my $pid;
+    my $loop = 0;
+
+    FORK: {
+        if ( defined( $pid = fork ) ) {
+            return $pid;
+        }
+
+        # EAGAIN - fork cannot allocate sufficient memory to copy the parent's
+        #          page tables and allocate a task structure for the child.
+        # ENOMEM - fork failed to allocate the necessary kernel structures
+        #          because memory is tight.
+        # Last the loop after 30 seconds
+        if ( $loop < 6 && ( $! == POSIX::EAGAIN() ||  $! == POSIX::ENOMEM() ) ) {
+            $loop++; sleep 5; redo FORK;
+        }
+    }
+
+    warn "Can't fork: $!";
+
+    return undef;
+}
+
+
+################################################################################
+# OpenMax( [ NUMBER ] )
+# Returns the maximum number of possible file descriptors. If sysconf()
+# does not give me a valid value, I return NUMBER (default is 64).
+################################################################################
+sub OpenMax {
+    my $openmax = POSIX::sysconf( &POSIX::_SC_OPEN_MAX );
+
+    return ( ! defined( $openmax ) || $openmax < 0 ) ?
+        ( shift || 64 ) : $openmax;
+}
+
+
+################################################################################
+# Check if the (daemon) process is alive:
+# Status( [ number or string ] )
+#
+# Examples:
+#   $object->Status() - Tries to get the PID out of the settings in new() and checks it.
+#   $object->Status( 12345 ) - Number of PID to check.
+#   $object->Status( './pid.txt' ) - Path to file containing one PID to check.
+#   $object->Status( 'perl /home/my_perl_daemon.pl' ) - Command line entry of the
+#               running program to check. Requires Proc::ProcessTable to work.
+#
+# Returns the PID (alive) or 0 (dead).
+################################################################################
+sub Status {
+    my Proc::Daemon $self = shift;
+    my $pid = shift;
+
+    # Get the process ID.
+    ( $pid, undef ) = $self->get_pid( $pid );
+
+    # Return if no PID was found.
+    return 0 if ! $pid;
+
+    # The kill(2) system call will check whether it's possible to send
+    # a signal to the pid (that means, to be brief, that the process
+    # is owned by the same user, or we are the super-user). This is a
+    # useful way to check that a child process is alive (even if only
+    # as a zombie) and hasn't changed its UID.
+    return ( kill( 0, $pid ) ? $pid : 0 );
+}
+
+
+################################################################################
+# Kill the (daemon) process:
+# Kill_Daemon( [ number or string [, SIGNAL ] ] )
+#
+# Examples:
+#   $object->Kill_Daemon() - Tries to get the PID out of the settings in new() and kill it.
+#   $object->Kill_Daemon( 12345, 'TERM' ) - Number of PID to kill with signal 'TERM'. The
+#     names or numbers of the signals are the ones listed out by kill -l on your system.
+#   $object->Kill_Daemon( './pid.txt' ) - Path to file containing one PID to kill.
+#   $object->Kill_Daemon( 'perl /home/my_perl_daemon.pl' ) - Command line entry of the
+#               running program to kill. Requires Proc::ProcessTable to work.
+#
+# Returns the number of processes successfully killed,
+# which mostly is not the same as the PID number.
+################################################################################
+sub Kill_Daemon {
+    my Proc::Daemon $self = shift;
+    my $pid    = shift;
+    my $signal = shift || 'KILL';
+    my $pidfile;
+
+    # Get the process ID.
+    ( $pid, $pidfile ) = $self->get_pid( $pid );
+
+    # Return if no PID was found.
+    return 0 if ! $pid;
+
+    # Kill the process.
+    my $killed = kill( $signal, $pid );
+
+    if ( $killed && $pidfile ) {
+        # Set PID in pid file to '0'.
+        if ( open( my $FH_PIDFILE, "+>", $pidfile ) ) {
+            print $FH_PIDFILE '0';
+            close $FH_PIDFILE;
+        }
+        else { warn "Can not open pidfile (pid_file => '$pidfile'): $!" }
+    }
+
+    return $killed;
+}
+
+
+################################################################################
+# Return the PID of a process:
+# get_pid( number or string )
+#
+# Examples:
+#   $object->get_pid() - Tries to get the PID out of the settings in new().
+#   $object->get_pid( 12345 ) - Number of PID to return.
+#   $object->get_pid( './pid.txt' ) - Path to file containing the PID.
+#   $object->get_pid( 'perl /home/my_perl_daemon.pl' ) - Command line entry of
+#               the running program. Requires Proc::ProcessTable to work.
+#
+# Returns an array with ( 'the PID | <undef>', 'the pid_file | <undef>' )
+################################################################################
+sub get_pid {
+    my Proc::Daemon $self = shift;
+    my $string = shift || '';
+    my ( $pid, $pidfile );
+
+    if ( $string ) {
+        # $string is already a PID.
+        if ( $string =~ /^\d+$/ ) {
+            $pid = $string;
+        }
+        # Open the pidfile and get the PID from it.
+        elsif ( open( my $FH_MEMORY, "<", $string ) ) {
+            $pid = <$FH_MEMORY>;
+            close $FH_MEMORY;
+
+            die "I found no valid PID ('$pid') in the pidfile: '$string'" if $pid =~ /\D/s;
+
+            $pidfile = $string;
+        }
+        # Get the PID by the system process table.
+        else {
+            $pid = $self->get_pid_by_proc_table_attr( 'cmndline', $string );
+        }
+    }
+
+
+    # Try to get the PID out of the new() settings.
+    if ( ! $pid ) {
+        # Try to get the PID out of the 'pid_file' setting.
+        if ( $self->{pid_file} && open( my $FH_MEMORY, "<", $self->{pid_file} ) ) {
+            $pid = <$FH_MEMORY>;
+            close $FH_MEMORY;
+
+            if ( ! $pid || ( $pid && $pid =~ /\D/s ) ) { $pid = undef }
+            else { $pidfile = $self->{pid_file} }
+        }
+
+        # Try to get the PID out of the system process
+        # table by the 'exec_command' setting.
+        if ( ! $pid && $self->{exec_command} ) {
+            $pid = $self->get_pid_by_proc_table_attr( 'cmndline', $self->{exec_command} );
+        }
+    }
+
+    return ( $pid, $pidfile );
+}
+
+
+################################################################################
+# This sub requires the Proc::ProcessTable module to be installed!!!
+#
+# Search for the PID of a process in the process table:
+# $object->get_pid_by_proc_table_attr( 'unix_process_table_attribute', 'string that must match' )
+#
+#   unix_process_table_attribute examples:
+#   For more see the README.... files at http://search.cpan.org/~durist/Proc-ProcessTable/
+#     uid      - UID of process
+#     pid      - process ID
+#     ppid     - parent process ID
+#     fname    - file name
+#     state    - state of process
+#     cmndline - full command line of process
+#     cwd      - current directory of process
+#
+# Example:
+#   get_pid_by_proc_table_attr( 'cmndline', 'perl /home/my_perl_daemon.pl' )
+#
+# Returns the process PID on success, otherwise <undef>.
+################################################################################
+sub get_pid_by_proc_table_attr {
+    my Proc::Daemon $self = shift;
+    my ( $command, $match ) = @_;
+    my $pid;
+
+    # eval - Module may not be installed
+    eval {
+        require Proc::ProcessTable;
+
+        my $table = Proc::ProcessTable->new()->table;
+
+        foreach ( @$table ) {
+            # fix for Proc::ProcessTable: under some conditions $_->cmndline
+            # retruns with space and/or other characters at the end
+            next unless $_->$command =~ /^$match\s*$/;
+            $pid = $_->pid;
+            last;
+        }
+    };
+
+    warn "- Problem in get_pid_by_proc_table_attr( '$command', '$match' ):\n  $@  You may not use a command line entry to get the PID of your process.\n  This function requires Proc::ProcessTable (http://search.cpan.org/~durist/Proc-ProcessTable/) to work.\n" if $@;
+
+    return $pid;
+}
+
+1;
+
+__END__
