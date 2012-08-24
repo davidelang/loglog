@@ -90,17 +90,17 @@ if (! -e $conf) {
    open (C, ">$conf");
    open (I, "find -L /opt/jboss -type f -mtime -1 -name '*.log' -print | grep -v 2012 |");
    while (<I>) {
-      print C;
+      print C "$_ unknown";
    }
    close I;
    open (I, "find -L /opt/mule -type f -mtime -1 -name '*.log' -print | grep -v 2012 |");
    while (<I>) {
-      print C;
+      print C "$_ unknown";
    }
    close I;
    open (I, "find -L /opt/di/system/jboss -type f -mtime -1 -name '*.log' -print | grep -v 2012 |");
    while (<I>) {
-      print C;
+      print C "$_ unknown";
    }
    close I;
    close C;
@@ -109,7 +109,8 @@ if (! -e $conf) {
 open (I, $conf); 
 while (<I>) {
    chomp;
-   push(@files, File::Tail->new(name=>"$_",debug=>$debug));
+   ($filename,$product) = split(" ",$_);
+   push(@files, [File::Tail->new(name=>"$filename",debug=>$debug),$product]);
 }
 close I;
 
@@ -123,29 +124,29 @@ send("status","finished init, configured to watch ".($#files+1)." logfiles, star
 	unless ($nfound) {
 	    my @ints;
 	    foreach(@files) {
-		push(@ints,$_->interval);
+		push(@ints,$_[0]->interval);
 	    }
 	}
 	foreach (@files) {
-            if ($_->predict == 0) {
-                my $t = $_->read; chomp($t);
-                my $name = $_->{"input"}; 
+            if ($_[0]->predict == 0) {
+                my $t = $_[0]->read; chomp($t);
+                my $name = $_[0]->{"input"}; 
 	        if ($t =~ /^\s/ ) {
 	            # the line starts with whitespace, assume it's a continuation of the prior line
 		    #   append it to the prior line, include a separator to indicate that we have done so
-		    $_->pending .= " #015 ".$t;
+		    $_[0]->pending .= " #015 ".$t;
                 } else {
 	            # if there is a prior line send it
-		    if ($_->pending ne "") {
-		        $filename = $_->{"input"};
-		        $product = "unknown";
-		        send($product, $_->pending);
+		    if ($_[0]->pending ne "") {
+		        $filename = $_[0]->{"input"};
+		        $product = $_[1] || "unknown";
+		        send($product, $_[0]->pending);
                         $sent++;
 		        $sentbytes += length($t);
 		        if (lenth($t) > $sentmaxlength) { $sentmaxlength = length($t); }
 		    }
 		    # replace the prior buffer (if any) with the new data
-		    $_->pending =$t;
+		    $_[0]->pending =$t;
 	        }
 	    }
 	}
