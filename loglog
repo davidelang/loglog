@@ -116,7 +116,7 @@ close I;
 my $rin='';
 $interval = 5 * 60; # 5 minutes
 $sent=0; $sentbytes=0; $sentmaxlength=0; $nextreport += $interval;
-send("status","finished init, processing logs");
+send("status","finished init, configured to watch ".($#files+1)." logfiles, starting processing of logs");
 
     while ($continue) {
 	$nfound=File::Tail::select(undef,undef,undef,60,@files);
