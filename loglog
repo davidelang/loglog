@@ -2,8 +2,14 @@
 
 use File::stat;
 use Time::localtime;
+use vars qw($VERSION);
+use IO::Socket;
+use Sys::Hostname;
 
-# Note that Proc::Daemon, File::Tail and Net::Syslog are included inline. 
+# Note that Proc::Daemon, and File::Tail are included inline. 
+
+# much of Net::Syslog has been copied. It's not used directly to allow logging with different programnames and to streamline dealing with long logs (re-coding send allows that routine to deal with long logs instead of needing the code in multiple places).
+
 
 $already_alive = `ps -ef | grep loglog | grep -v grep` + 0;
 if ($already_alive) { exit; }
@@ -16,13 +22,68 @@ Proc::Daemon::Init;
 my $continue = 1;
 $SIG{TERM} = sub { $continue = 0 };
 
-$log = new Net::Syslog(Facility=>'local6', Priority=>'info', SyslogHost=>'scribe');
+my %syslog_priorities = (
+    emerg         => 0,
+    emergency     => 0,
+    alert         => 1,
+    crit          => 2,
+    critical      => 2,
+    err           => 3,
+    error         => 3,
+    warning       => 4,
+    notice        => 5,
+    info          => 6,
+    informational => 6,
+    debug         => 7
+);
+
+my %syslog_facilities = (
+    kern      => 0,
+    kernel    => 0,
+    user      => 1,
+    mail      => 2,
+    daemon    => 3,
+    system    => 3,
+    auth      => 4,
+    syslog    => 5,
+    internal  => 5,
+    lpr       => 6,
+    printer   => 6,
+    news      => 7,
+    uucp      => 8,
+    cron      => 9,
+    clock     => 9,
+    authpriv  => 10,
+    security2 => 10,
+    ftp       => 11,
+    FTP       => 11,
+    NTP       => 11,
+    audit     => 13,
+    alert     => 14,
+    clock2    => 15,
+    local0    => 16,
+    local1    => 17,
+    local2    => 18,
+    local3    => 19,
+    local4    => 20,
+    local5    => 21,
+    local6    => 22,
+    local7    => 23,
+);
+
+my @month = qw{Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec};
+$SyslogHost = 'scribe';
+$Facility = 'local6';
+$priority = 'info';
+$Pid        => $$,
+$SyslogPort => 514,
+$maxloglenth = 4000;
 $host = `hostname -s`; chomp($host);
 $conf = "/opt/disys/etc/loglog/$host.conf";
 # print "config is $conf\n";
 
 my $timestamp = localtime(time);
-$log->send("$host loglog-status Startup (program timestamp is $mytimestamp)");
+send("status","Startup (program timestamp is $mytimestamp)");
 
 if (! -e $conf) {
    $log->send("$host loglog $timestamp Creating default logfile list");
@@ -54,8 +115,8 @@ close I;
 
 my $rin='';
 $interval = 5 * 60; # 5 minutes
-$sent = 0; $nextreport = time + $interval;
-$log->send("$host : loglog-start");
+$sent=0; $sentbytes=0; $sentmaxlength=0; $nextreport += $interval;
+send("status","finished init, processing logs");
 
     while ($continue) {
 	$nfound=File::Tail::select(undef,undef,undef,60,@files);
@@ -67,33 +128,77 @@ $log->send("$host : loglog-start");
 	}
 	foreach (@files) {
             if ($_->predict == 0) {
-               my $t = $_->read; chomp($t);
-               my $name = $_->{"input"}; 
-               my @parts = unpack("(A3500)*", $t); # Deal with really long lines
-               my $plen = scalar(@parts);
-               if ($plen == 1) { 
-                  $log->send("$host $name : $t");
-                  }
-               else {
-                  my $pc = 0;
-                  foreach $p (@parts) {
-                     $pc += 1;
-                     $log->send("$host $name ($sent-$pc/$plen) : $parts[$p]");
-                  }
-               }
-               $sent++; $sentbytes += length($t);
-            }
+                my $t = $_->read; chomp($t);
+                my $name = $_->{"input"}; 
+	        if ($t =~ /^\s/ ) {
+	            # the line starts with whitespace, assume it's a continuation of the prior line
+		    #   append it to the prior line, include a separator to indicate that we have done so
+		    $_->pending .= " #015 ".$t;
+                } else {
+	            # if there is a prior line send it
+		    if ($_->pending ne "") {
+		        $filename = $_->{"input"};
+		        $product = "unknown";
+		        send($product, $_->pending);
+                        $sent++;
+		        $sentbytes += length($t);
+		        if (lenth($t) > $sentmaxlength) { $sentmaxlength = length($t); }
+		    }
+		    # replace the prior buffer (if any) with the new data
+		    $_->pending =$t;
+	        }
+	    }
 	}
         if (time > $nextreport) { 
-           $log->send("$host loglog-status sent $sent lines ($sentbytes bytes)");
-           $sent=0; $sentbytes=0; $nextreport += $interval;
+           $log->send("$host loglog-status sent lines=$sent bytes=$sentbytes maxlength=$sentmaxlength");
+           $sent=0; $sentbytes=0; $sentmaxlength=0; $nextreport += $interval;
         }
         $mynewtimestamp = ctime(stat("/opt/disys/noarch/loglog")->mtime);
         if ($mynewtimestamp ne $mytimestamp) { # Modified! die, and watchdog will restart
-           $log->send("$host loglog-status program updated, aborting");
+           $log->send("status", "program updated, aborting");
            exit;
         }
     }
+
+sub send {
+    my $sock = new IO::Socket::INET(
+        PeerAddr => $SyslogHost,
+        PeerPort => $SyslogPort,
+        Proto    => 'udp'
+    );
+    die "Socket could not be created : $!\n" unless $sock;
+    my $name   = shift;
+    my $msg   = shift;
+
+    my $facility_i = $syslog_facilities{ $Facility } || 21;
+    my $priority_i = $syslog_priorities{ $Priority } || 3;
+
+    my $d = ( ( $facility_i << 3 ) | ($priority_i) );
+
+    my @time = localtime();
+    my $ts =
+        $month[ $time[4] ] . " "
+      . ( ( $time[3] < 10 ) ? ( " " . $time[3] ) : $time[3] ) . " "
+      . ( ( $time[2] < 10 ) ? ( "0" . $time[2] ) : $time[2] ) . ":"
+      . ( ( $time[1] < 10 ) ? ( "0" . $time[1] ) : $time[1] ) . ":"
+      . ( ( $time[0] < 10 ) ? ( "0" . $time[0] ) : $time[0] );
+
+    while ($msg) {
+        $messagelength = rindex $msg, " ", $maxloglenth ; #find the position of the last space before position $maxloglenth
+        push @messages substr $msg, 0, $messagelength;
+        $msg = substr $msg, ($messagelength + ) # skip the space
+    }
+    if ($#messages = 1) {
+	$message = "<$d>$ts $host loglog-$name[$pid]: $messages[0]";
+        print $sock $message;
+    } else {
+        for ($i=0; $i<$#message; $i++){
+            $message = "<$d>$ts $host loglog-$name[$pid]i: ($i/$#messages): $messages[$i]";
+            print $sock $message;
+        }
+    }
+    $sock->close();
+}
 
 package File::Tail;
 
@@ -678,132 +783,6 @@ sub read {
 
 1;
 
-package Net::Syslog;
-
-use vars qw($VERSION);
-#use warnings;
-#use strict;
-use IO::Socket;
-use Sys::Hostname;
-
-$VERSION = '0.04';
-
-# Preloaded methods go here.
-
-my %syslog_priorities = (
-    emerg         => 0,
-    emergency     => 0,
-    alert         => 1,
-    crit          => 2,
-    critical      => 2,
-    err           => 3,
-    error         => 3,
-    warning       => 4,
-    notice        => 5,
-    info          => 6,
-    informational => 6,
-    debug         => 7
-);
-
-my %syslog_facilities = (
-    kern      => 0,
-    kernel    => 0,
-    user      => 1,
-    mail      => 2,
-    daemon    => 3,
-    system    => 3,
-    auth      => 4,
-    syslog    => 5,
-    internal  => 5,
-    lpr       => 6,
-    printer   => 6,
-    news      => 7,
-    uucp      => 8,
-    cron      => 9,
-    clock     => 9,
-    authpriv  => 10,
-    security2 => 10,
-    ftp       => 11,
-    FTP       => 11,
-    NTP       => 11,
-    audit     => 13,
-    alert     => 14,
-    clock2    => 15,
-    local0    => 16,
-    local1    => 17,
-    local2    => 18,
-    local3    => 19,
-    local4    => 20,
-    local5    => 21,
-    local6    => 22,
-    local7    => 23,
-);
-
-my @month = qw{Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec};
-
-sub new {
-    my $class = shift;
-    my $name  = $0;
-    if ( $name =~ /.+\/(.+)/ ) {
-        $name = $1;
-    }
-    my $self = {
-        Name       => $name,
-        Facility   => 'local5',
-        Priority   => 'error',
-        Pid        => $$,
-        SyslogPort => 514,
-        SyslogHost => '127.0.0.1'
-    };
-    bless $self, $class;
-    my %par = @_;
-    foreach ( keys %par ) {
-        $self->{$_} = $par{$_};
-    }
-    return $self;
-}
-
-sub send {
-    my $self  = shift;
-    my $msg   = shift;
-    my %par   = @_;
-    my %local = %$self;
-    foreach ( keys %par ) {
-        $local{$_} = $par{$_};
-    }
-
-    my $pid = ( $local{Pid} =~ /^\d+$/ ) ? "\[$local{Pid}\]" : "";
-    my $facility_i = $syslog_facilities{ $local{Facility} } || 21;
-    my $priority_i = $syslog_priorities{ $local{Priority} } || 3;
-
-    my $d = ( ( $facility_i << 3 ) | ($priority_i) );
-
-    my $host = inet_ntoa( ( gethostbyname(hostname) )[4] );
-    my @time = localtime();
-    my $ts =
-        $month[ $time[4] ] . " "
-      . ( ( $time[3] < 10 ) ? ( " " . $time[3] ) : $time[3] ) . " "
-      . ( ( $time[2] < 10 ) ? ( "0" . $time[2] ) : $time[2] ) . ":"
-      . ( ( $time[1] < 10 ) ? ( "0" . $time[1] ) : $time[1] ) . ":"
-      . ( ( $time[0] < 10 ) ? ( "0" . $time[0] ) : $time[0] );
-    my $message = '';
-
-    if ( $local{rfc3164} ) {
-        $message = "<$d>$ts $host $local{Name}$pid: $msg";
-    }
-    else {
-        $message = "<$d>$local{Name}$pid: $msg";
-    }
-
-    my $sock = new IO::Socket::INET(
-        PeerAddr => $local{SyslogHost},
-        PeerPort => $local{SyslogPort},
-        Proto    => 'udp'
-    );
-    die "Socket could not be created : $!\n" unless $sock;
-    print $sock $message;
-    $sock->close();
-}
 
 # Autoload methods go after =cut, and are processed by the autosplit program.
 
