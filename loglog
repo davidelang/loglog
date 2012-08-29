@@ -194,7 +194,7 @@ sub send {
         print $sock $message;
     } else {
         for ($i=0; $i<$#message; $i++){
-            $message = "<$d>$ts $host loglog-$name[$pid]i: ($i/$#messages): $messages[$i]";
+            $message = "<$d>$ts $host loglog-$name[$pid]: ($i/$#messages): $messages[$i]";
             print $sock $message;
         }
     }
