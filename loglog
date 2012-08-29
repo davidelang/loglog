@@ -83,10 +83,10 @@ $conf = "/opt/disys/etc/loglog/$host.conf";
 # print "config is $conf\n";
 
 my $timestamp = localtime(time);
-send("status","Startup (program timestamp is $mytimestamp)");
+sendlog("status","Startup (program timestamp is $mytimestamp)");
 
 if (! -e $conf) {
-   $log->send("$host loglog $timestamp Creating default logfile list");
+   sendlog("$host loglog $timestamp Creating default logfile list");
    open (C, ">$conf");
    open (I, "find -L /opt/jboss -type f -mtime -1 -name '*.log' -print | grep -v 2012 |");
    while (<I>) {
@@ -117,7 +117,7 @@ close I;
 my $rin='';
 $interval = 5 * 60; # 5 minutes
 $sent=0; $sentbytes=0; $sentmaxlength=0; $nextreport += $interval;
-send("status","finished init, configured to watch ".($#files+1)." logfiles, starting processing of logs");
+sendlog("status","finished init, configured to watch ".($#files+1)." logfiles, starting processing of logs");
 
     while ($continue) {
 	$nfound=File::Tail::select(undef,undef,undef,60,@files);
@@ -140,7 +140,7 @@ send("status","finished init, configured to watch ".($#files+1)." logfiles, star
 		    if ($_[0]->pending ne "") {
 		        $filename = $_[0]->{"input"};
 		        $product = $_[1] || "unknown";
-		        send($product, $_[0]->pending);
+		        sendlog($product, $_[0]->pending);
                         $sent++;
 		        $sentbytes += length($t);
 		        if (lenth($t) > $sentmaxlength) { $sentmaxlength = length($t); }
@@ -151,12 +151,12 @@ send("status","finished init, configured to watch ".($#files+1)." logfiles, star
 	    }
 	}
         if (time > $nextreport) { 
-           $log->send("$host loglog-status sent lines=$sent bytes=$sentbytes maxlength=$sentmaxlength");
+           sendlog("$host loglog-status sent lines=$sent bytes=$sentbytes maxlength=$sentmaxlength");
            $sent=0; $sentbytes=0; $sentmaxlength=0; $nextreport += $interval;
         }
         $mynewtimestamp = ctime(stat("/opt/disys/noarch/loglog")->mtime);
         if ($mynewtimestamp ne $mytimestamp) { # Modified! die, and watchdog will restart
-           $log->send("status", "program updated, aborting");
+           sendlog("status", "program updated, aborting");
            exit;
         }
     }
@@ -186,8 +186,8 @@ sub send {
 
     while ($msg) {
         $messagelength = rindex $msg, " ", $maxloglenth ; #find the position of the last space before position $maxloglenth
-        push @messages substr $msg, 0, $messagelength;
-        $msg = substr $msg, ($messagelength + ) # skip the space
+        push @messages, substr($msg, 0, $messagelength);
+        $msg = substr($msg, $messagelength); # skip the space
     }
     if ($#messages = 1) {
 	$message = "<$d>$ts $host loglog-$name[$pid]: $messages[0]";
