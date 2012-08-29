@@ -7,6 +7,9 @@
 $host = `hostname -s`; chomp($host);
 $conf = "/opt/disys/etc/loglog/$host.conf";
 
+$loglog = "/opt/disys/noarch/loglog";
+if ($host eq "comet1a") { $loglog .= "-test"; }
+
 $ok = `ps -ef | grep watchloglog | grep -v grep | wc -l` + 0;
 if ($ok > 1) { exit; }
 
@@ -14,6 +17,6 @@ while (1) {
    $ok = `ps -ef | grep loglog | grep -v watchloglog | grep -v grep | wc -l` + 0; 
    if ($ok) { sleep(10); next; }
    if (-e $conf) { 
-      system("/opt/disys/noarch/loglog &");
+      system("$loglog &");
    }
 }
