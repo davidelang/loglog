@@ -14,7 +14,8 @@ use Sys::Hostname;
 $already_alive = `ps -ef | grep loglog | grep -v grep` + 0;
 if ($already_alive) { exit; }
 
-$mytimestamp = ctime(stat("/opt/disys/noarch/loglog")->mtime);
+@junk = stat("/opt/disys/noarch/loglog");
+$mytimestamp = $junk[10];
 
 $debug=0;
 
@@ -154,14 +155,15 @@ sendlog("status","finished init, configured to watch ".($#files+1)." logfiles, s
            sendlog("$host loglog-status sent lines=$sent bytes=$sentbytes maxlength=$sentmaxlength");
            $sent=0; $sentbytes=0; $sentmaxlength=0; $nextreport += $interval;
         }
-        $mynewtimestamp = ctime(stat("/opt/disys/noarch/loglog")->mtime);
+        @junk = stat("/opt/disys/noarch/loglog");
+        $mynewtimestamp = $junk[10];
         if ($mynewtimestamp ne $mytimestamp) { # Modified! die, and watchdog will restart
            sendlog("status", "program updated, aborting");
            exit;
         }
     }
 
-sub send {
+sub sendlog {
     my $sock = new IO::Socket::INET(
         PeerAddr => $SyslogHost,
         PeerPort => $SyslogPort,
