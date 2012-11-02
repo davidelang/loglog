@@ -5,6 +5,7 @@ use Time::localtime;
 use vars qw($VERSION);
 use IO::Socket;
 use Sys::Hostname;
+use Data::Dumper;
 $|=1;
 # Note that Proc::Daemon, and File::Tail are included inline. 
 
@@ -85,6 +86,11 @@ $host = `hostname -s`; chomp($host);
 $conf = "/opt/disys/etc/loglog/$host.conf";
 # print "config is $conf\n";
 
+#these three arrays are tied together, element X of each array correspond to each other.
+@files=();
+@names=();
+@pending=();
+
 my $timestamp = localtime(time);
 sendlog("status","Startup (program timestamp is $mytimestamp)");
 
@@ -113,13 +119,15 @@ open (I, $conf);
 while (<I>) {
    chomp;
    ($filename,$product) = split(" ",$_);
-   push(@files, [File::Tail->new(name=>"$filename",debug=>$debug),$product]);
+   if ($product eq '') {$product = "unknown";}
+   push(@files, File::Tail->new(name=>"$filename",debug=>$debug));
+   push(@names, $product);
 }
 close I;
 
 my $rin='';
 $interval = 5 * 60; # 5 minutes
-$sent=0; $sentbytes=0; $sentmaxlength=0; $nextreport += $interval;
+$sent=0; $sentbytes=0; $sentmaxlength=0; $nextreport = time + $interval;
 sendlog("status","finished init, configured to watch ".($#files+1)." logfiles, starting processing of logs");
 
     while ($continue) {
@@ -127,31 +135,48 @@ sendlog("status","finished init, configured to watch ".($#files+1)." logfiles, s
 	unless ($nfound) {
 	    my @ints;
 	    foreach(@files) {
-		push(@ints,$_[0]->interval);
+		push(@ints,$_->interval);
 	    }
 	}
-	foreach (@files) {
-            if ($_[0]->predict == 0) {
-                my $t = $_[0]->read; chomp($t);
-                my $name = $_[0]->{"input"}; 
+	for($i=0; $i<=$#files; $i++) {
+        #print "$i $names[$i]\n";
+        #print "  ".time."\n";
+            $thisfiletail = $files[$i];
+            if ($thisfiletail->predict == 0) {
+                my $t = $thisfiletail->read; chomp($t);
+                #print "  $t\n";
+                my $name = $thisfiletail->{"input"}; 
 	        if ($t =~ /^\s/ ) {
 	            # the line starts with whitespace, assume it's a continuation of the prior line
 		    #   append it to the prior line, include a separator to indicate that we have done so
-		    $_[0]->pending .= " #015 ".$t;
+		    $pending[$i] .= " #015 ".$t;
                 } else {
 	            # if there is a prior line send it
-		    if ($_[0]->pending ne "") {
-		        $filename = $_[0]->{"input"};
-		        $product = $_[1] || "unknown";
-		        sendlog($product, $_[0]->pending);
+		    if ($pending[$i] ne "") {
+		        $filename = $thisfiletail->{"input"};
+		        $product = $$names[$i];
+		        sendlog($product, $pending[$i]);
                         $sent++;
 		        $sentbytes += length($t);
-		        if (lenth($t) > $sentmaxlength) { $sentmaxlength = length($t); }
+		        if (length($t) > $sentmaxlength) { $sentmaxlength = length($t); }
 		    }
 		    # replace the prior buffer (if any) with the new data
-		    $_[0]->pending =$t;
+		    $pending[$i] =$t;
 	        }
+	    } elsif ($pending[$i] ne "") {
+                # if there is no new information, send anything that's pending anyway.
+                # without this the last line of a log will never get sent.
+                # With this it waits one timeout, then gets sent.
+
+	        $filename = $thisfiletail->{"input"};
+	        $product = $$names[$i];
+	        sendlog($product, $pending[$i]);
+                $sent++;
+	        $sentbytes += length($t);
+	        if (length($t) > $sentmaxlength) { $sentmaxlength = length($t); }
+	        $pending[$i] ='';
 	    }
+
 	}
         if (time > $nextreport) { 
            sendlog("$host loglog-status sent lines=$sent bytes=$sentbytes maxlength=$sentmaxlength");
@@ -172,6 +197,7 @@ sub sendlog {
     ) or die "Socket could not be created : $!\n";
     my $name   = shift;
     my $msg   = shift;
+    #print "sending log for $name $msg\n";
 
     my $facility_i = $syslog_facilities{ $Facility } || 21;
     my $priority_i = $syslog_priorities{ $Priority } || 7;
@@ -195,12 +221,15 @@ sub sendlog {
     if ($#messages = 1) {
 	$message = "<$d>$ts $host loglog-${name}[$pid]: $messages[0]";
         print $sock $message;
+        #print  $message,"\n";;
     } else {
         for ($i=0; $i<$#message; $i++){
             $message = "<$d>$ts $host loglog-${name}[$pid]: ($i/$#messages): $messages[$i]";
             print $sock $message;
+            #print  $message,"\n";;
         }
     }
+    @messages=();
     $sock->close();
 }
 
@@ -244,13 +273,7 @@ sub interval {
 sub logit {
     my $object=shift;
     my @call=caller(1);
-    print # STDERR 
-#	time()." ".
-	"\033[7m".
-	    $call[3]." ".$object->{"input"}." ".join("",@_).
-		"\033[0m".
-		    "\n"
-	if $object->debug;
+    print  STDERR time()." ".  "\033[7m".  $call[3]." ".$object->{"input"}." ".join("",@_).  "\033[0m".  "\n" if $object->debug;
 }
 
 sub adjustafter {
