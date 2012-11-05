@@ -77,10 +77,12 @@ my %syslog_facilities = (
 
 my @month = qw{Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec};
 $SyslogHost = 'scribe';
+#$SyslogHost = 'localhost';
 $Facility = 'local6';
 $priority = 'info';
 $pid        = $$,
 $SyslogPort = 514,
+#$SyslogPort = 10514,
 $maxloglength = 4000;
 $host = `hostname -s`; chomp($host);
 $conf = "/opt/disys/etc/loglog/$host.conf";
@@ -154,7 +156,7 @@ sendlog("status","finished init, configured to watch ".($#files+1)." logfiles, s
 	            # if there is a prior line send it
 		    if ($pending[$i] ne "") {
 		        $filename = $thisfiletail->{"input"};
-		        $product = $$names[$i];
+		        $product = $names[$i];
 		        sendlog($product, $pending[$i]);
                         $sent++;
 		        $sentbytes += length($t);
@@ -169,7 +171,7 @@ sendlog("status","finished init, configured to watch ".($#files+1)." logfiles, s
                 # With this it waits one timeout, then gets sent.
 
 	        $filename = $thisfiletail->{"input"};
-	        $product = $$names[$i];
+	        $product = $names[$i];
 	        sendlog($product, $pending[$i]);
                 $sent++;
 	        $sentbytes += length($t);
@@ -195,9 +197,9 @@ sub sendlog {
         PeerPort => $SyslogPort,
         Proto    => 'udp'
     ) or die "Socket could not be created : $!\n";
-    my $name   = shift;
-    my $msg   = shift;
-    #print "sending log for $name $msg\n";
+    my $product   = shift;
+    my $msg   = shift || "NO MESSAGE";
+    #print "sending log for $product $msg\n";
 
     my $facility_i = $syslog_facilities{ $Facility } || 21;
     my $priority_i = $syslog_priorities{ $Priority } || 7;
@@ -219,12 +221,12 @@ sub sendlog {
     }
     push @messages, $msg;
     if ($#messages = 1) {
-	$message = "<$d>$ts $host loglog-${name}[$pid]: $messages[0]";
+	$message = "<$d>$ts $host loglog-${product}[$pid]: $messages[0]";
         print $sock $message;
         #print  $message,"\n";;
     } else {
         for ($i=0; $i<$#message; $i++){
-            $message = "<$d>$ts $host loglog-${name}[$pid]: ($i/$#messages): $messages[$i]";
+            $message = "<$d>$ts $host loglog-${product}[$pid]: ($i/$#messages): $messages[$i]";
             print $sock $message;
             #print  $message,"\n";;
         }
