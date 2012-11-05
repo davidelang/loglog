@@ -183,7 +183,7 @@ sendlog("status","finished init, configured to watch ".($#files+1)." logfiles, s
 
 	}
         if (time > $nextreport) { 
-           sendlog("$host loglog-status sent lines=$sent bytes=$sentbytes maxlength=$sentmaxlength");
+           sendlog("status" "sent lines=$sent bytes=$sentbytes maxlength=$sentmaxlength");
            $sent=0; $sentbytes=0; $sentmaxlength=0; $nextreport += $interval;
         }
         $mynewtimestamp = ctime(stat($loglogname)->mtime);
