@@ -119,11 +119,13 @@ if (! -e $conf) {
 
 open (I, $conf); 
 while (<I>) {
-   chomp;
-   ($filename,$product) = split(" ",$_);
-   if ($product eq '') {$product = "unknown";}
-   push(@files, File::Tail->new(name=>"$filename",debug=>$debug));
-   push(@names, $product);
+    chomp;
+    ($filename,$product) = split(" ",$_);
+    if ($product eq '') {$product = "unknown";}
+    if (-e $filename) {
+        push(@files, File::Tail->new(name=>"$filename",debug=>$debug));
+        push(@names, $product);
+    }
 }
 close I;
 
