@@ -146,6 +146,8 @@ sendlog("status","finished init, configured to watch ".($#files+1)." logfiles, s
         #print "$i $names[$i]\n";
         #print "  ".time."\n";
             $thisfiletail = $files[$i];
+            $filename = $thisfiletail->{"input"};
+            $product = $names[$i];
             if ($thisfiletail->predict == 0) {
                 my $t = $thisfiletail->read; chomp($t);
                 #print "  $t\n";
@@ -157,9 +159,7 @@ sendlog("status","finished init, configured to watch ".($#files+1)." logfiles, s
                 } else {
 	            # if there is a prior line send it
 		    if ($pending[$i] ne "") {
-		        $filename = $thisfiletail->{"input"};
-		        $product = $names[$i];
-		        sendlog($product, $pending[$i]);
+		        sendlog($product, $filename.': '.$pending[$i]);
                         $sent++;
 		        $sentbytes += length($t);
 		        if (length($t) > $sentmaxlength) { $sentmaxlength = length($t); }
@@ -172,9 +172,7 @@ sendlog("status","finished init, configured to watch ".($#files+1)." logfiles, s
                 # without this the last line of a log will never get sent.
                 # With this it waits one timeout, then gets sent.
 
-	        $filename = $thisfiletail->{"input"};
-	        $product = $names[$i];
-	        sendlog($product, $pending[$i]);
+	        sendlog($product, $filename.': '.$pending[$i]);
                 $sent++;
 	        $sentbytes += length($t);
 	        if (length($t) > $sentmaxlength) { $sentmaxlength = length($t); }
@@ -183,7 +181,7 @@ sendlog("status","finished init, configured to watch ".($#files+1)." logfiles, s
 
 	}
         if (time > $nextreport) { 
-           sendlog("status" "sent lines=$sent bytes=$sentbytes maxlength=$sentmaxlength");
+           sendlog("status","sent lines=$sent bytes=$sentbytes maxlength=$sentmaxlength");
            $sent=0; $sentbytes=0; $sentmaxlength=0; $nextreport += $interval;
         }
         $mynewtimestamp = ctime(stat($loglogname)->mtime);
