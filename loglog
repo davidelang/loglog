@@ -150,17 +150,18 @@ sendlog("status","finished init, configured to watch ".($#files+1)." logfiles, s
                 my $t = $thisfiletail->read; chomp($t);
                 #print "  $t\n";
                 my $name = $thisfiletail->{"input"}; 
-	        if ($t =~ /^\s/ ) {
+	        if ($t =~ /^\s/ || length($pending[$i]) > 65535) {
 	            # the line starts with whitespace, assume it's a continuation of the prior line
 		    #   append it to the prior line, include a separator to indicate that we have done so
+                    # if the line is longer than 64K, send what we have anyway.
 		    $pending[$i] .= " #015 ".$t;
                 } else {
 	            # if there is a prior line send it
 		    if ($pending[$i] ne "") {
 		        sendlog($product, $filename.': '.$pending[$i]);
                         $sent++;
-		        $sentbytes += length($t);
-		        if (length($t) > $sentmaxlength) { $sentmaxlength = length($t); }
+		        $sentbytes += length($pending[$i]);
+		        if (length($pending[$i]) > $sentmaxlength) { $sentmaxlength = length($pending[$i]); }
 		    }
 		    # replace the prior buffer (if any) with the new data
 		    $pending[$i] =$t;
@@ -172,8 +173,8 @@ sendlog("status","finished init, configured to watch ".($#files+1)." logfiles, s
 
 	        sendlog($product, $filename.': '.$pending[$i]);
                 $sent++;
-	        $sentbytes += length($t);
-	        if (length($t) > $sentmaxlength) { $sentmaxlength = length($t); }
+	        $sentbytes += length($pending[$i]);
+		if (length($pending[$i]) > $sentmaxlength) { $sentmaxlength = length($pending[$i]); }
 	        $pending[$i] ='';
 	    }
 
