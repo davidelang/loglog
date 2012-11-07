@@ -122,10 +122,8 @@ while (<I>) {
     chomp;
     ($filename,$product) = split(" ",$_);
     if ($product eq '') {$product = "unknown";}
-    if (-e $filename) {
-        push(@files, File::Tail->new(name=>"$filename",debug=>$debug));
-        push(@names, $product);
-    }
+    push(@files, File::Tail->new(name=>"$filename",debug=>$debug,ignore_nonexistant=>TRUE));
+    push(@names, $product);
 }
 close I;
 
