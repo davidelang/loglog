@@ -30,18 +30,17 @@ if (!$conf) {$conf = "/opt/disys/etc/loglog/$host.conf";}
 if ($help) {
   print STDERR "usage info\n";
   print STDERR " --help  dump this info\n";
-  print STDERR " --debug=#\n";
   print STDERR " --file=config file name\n";
   print STDERR " --maxloglength=#\n";
   print STDERR " --server=syslogserver\n";
   print STDERR " --port=syslogport\n";
   print STDERR " --priority=syslog priority\n";
   print STDERR " --facility=syslog facility\n";
+  print STDERR " --debug=#\n";
   exit;
 }
 $already_alive = `ps -ef | grep loglog | grep -v grep` + 0;
 if ($already_alive) {
-    # print STDERR "Already running\n";
     exit;
 }
 
@@ -188,8 +187,7 @@ my %syslog_facilities = (
 );
 
 my @month = qw{Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec};
-$pid        = $$,
-# print "config is $conf\n";
+$pid        = $$;
 
 #these three arrays are tied together, element X of each array correspond to each other.
 @files=();
@@ -244,14 +242,11 @@ sendlog("status","finished init, configured to watch ".($#files+1)." logfiles, s
 	    }
 	}
 	for($i=0; $i<=$#files; $i++) {
-        #print "$i $names[$i]\n";
-        #print "  ".time."\n";
             $thisfiletail = $files[$i];
             $filename = $thisfiletail->{"input"};
             $product = $names[$i];
             if ($thisfiletail->predict == 0) {
                 my $t = $thisfiletail->read; chomp($t);
-                #print "  $t\n";
                 my $name = $thisfiletail->{"input"}; 
 	        if ($t =~ /^\s/ || length($pending[$i]) > 65535) {
 	            # the line starts with whitespace, assume it's a continuation of the prior line
@@ -301,7 +296,6 @@ sub sendlog {
     ) or die "Socket could not be created : $!\n";
     my $product   = shift;
     my $msg   = shift || "NO MESSAGE";
-    #print "sending log for $product $msg\n";
 
     my $facility_i = $syslog_facilities{ $Facility } || 21;
     my $priority_i = $syslog_priorities{ $Priority } || 7;
@@ -318,19 +312,30 @@ sub sendlog {
 
     while (length($msg) > $maxloglength) {
         $messagelength = rindex $msg, " ", $maxloglength ; #find the position of the last space before position $maxloglenth
+        $offset=1;
+        if ($messagelength == -1) {
+            $messagelength = rindex $msg, "\t", $maxloglength ; #find the position of the last tab before position $maxloglenth
+            $offset=1;
+        }
+        if ($messagelength == -1) {
+            $messagelength = rindex $msg, "#015", $maxloglength ; #find the position of the last escaped newline before position $maxloglenth
+            $offset=4;
+        }
+        if ($messagelength == -1) {
+            $messagelength = $maxloglength; #if all else fails, just trim the log at the max size, no matter where in the message it is.
+            $offset=0;
+        }
         push @messages, substr($msg, 0, $messagelength);
-        $msg = substr($msg, $messagelength); # skip the space
+        $msg = substr($msg, $messagelength +$offset); # skip the thing we are splitting on
     }
     push @messages, $msg;
-    if ($#messages = 1) {
+    if ($#messages == 0) {
 	$message = "<$d>$ts $host loglog-${product}[$pid]: $messages[0]";
         print $sock $message;
-        #print  $message,"\n";;
     } else {
-        for ($i=0; $i<$#message; $i++){
-            $message = "<$d>$ts $host loglog-${product}[$pid]: ($i/$#messages): $messages[$i]";
+        for ($j=0; $j<=$#messages; $j++){
+            $message = "<$d>$ts $host loglog-${product}[$pid]: (".($j+1).'/'.($#messages+1)."): $messages[$j]";
             print $sock $message;
-            #print  $message,"\n";;
         }
     }
     @messages=();
