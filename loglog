@@ -6,12 +6,39 @@ use vars qw($VERSION);
 use IO::Socket;
 use Sys::Hostname;
 use Data::Dumper;
+use Getopt::Long;
 $|=1;
 # Note that Proc::Daemon, and File::Tail are included inline. 
+$host = `hostname -s`; chomp($host);
 
-# much of Net::Syslog has been copied. It's not used directly to allow logging with different programnames and to streamline dealing with long logs (re-coding send allows that routine to deal with long logs instead of needing the code in multiple places).
+GetOptions("debug:i" => \$debug, 
+    "file=s" => \$conf, 
+    "help" => \$help,
+    "maxloglength=i" => \$maxloglength,
+    "port=s" => \$SyslogPort,
+    "priorty=s" => \$priority,
+    "facility=s" => \$Facility,
+    "server=s" => \$SyslogHost);
 
-
+if (!$debug) {$debug = 0;}
+if (!$SyslogHost) {$SyslogHost = 'scribe';}
+if (!$Facility) {$Facility = 'local6';}
+if (!$priority) {$priority = 'info';}
+if (!$SyslogPort) {$SyslogPort = 514,}
+if (!$maxloglength) {$maxloglength = 4000;}
+if (!$conf) {$conf = "/opt/disys/etc/loglog/$host.conf";}
+if ($help) {
+  print STDERR "usage info\n";
+  print STDERR " --help  dump this info\n";
+  print STDERR " --debug=#\n";
+  print STDERR " --file=config file name\n";
+  print STDERR " --maxloglength=#\n";
+  print STDERR " --server=syslogserver\n";
+  print STDERR " --port=syslogport\n";
+  print STDERR " --priority=syslog priority\n";
+  print STDERR " --facility=syslog facility\n";
+  exit;
+}
 $already_alive = `ps -ef | grep loglog | grep -v grep` + 0;
 if ($already_alive) {
     # print STDERR "Already running\n";
@@ -20,7 +47,6 @@ if ($already_alive) {
 
 $loglogname = File::Spec->rel2abs($0);
 $mytimestamp = ctime(stat($loglogname)->mtime);
-$debug=0;
 
 Proc::Daemon::Init;
 my $continue = 1;
@@ -162,16 +188,7 @@ my %syslog_facilities = (
 );
 
 my @month = qw{Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec};
-$SyslogHost = 'scribe';
-#$SyslogHost = 'localhost';
-$Facility = 'local6';
-$priority = 'info';
 $pid        = $$,
-$SyslogPort = 514,
-#$SyslogPort = 10514,
-$maxloglength = 4000;
-$host = `hostname -s`; chomp($host);
-$conf = "/opt/disys/etc/loglog/$host.conf";
 # print "config is $conf\n";
 
 #these three arrays are tied together, element X of each array correspond to each other.
