@@ -200,26 +200,27 @@ if ($debug & 1) { print "config is $conf\n"; }
 @files=();
 @names=();
 @pending=();
+@hostnames=();
 
 my $timestamp = localtime(time);
-sendlog("status","Startup (program timestamp is $mytimestamp)");
+sendlog("status",$host,"Startup (program timestamp is $mytimestamp)");
 
 if (! -e $conf) {
-   sendlog("$host loglog $timestamp Creating default logfile list");
+   sendlog("status",$host,"Creating default logfile list");
    open (C, ">$conf");
    open (I, "find -L /opt/jboss -type f -mtime -1 -name '*.log' -print | grep -v 2012 |");
    while (<I>) {
-      print C "$_ unknown";
+      print C "$_ unknown $host";
    }
    close I;
    open (I, "find -L /opt/mule -type f -mtime -1 -name '*.log' -print | grep -v 2012 |");
    while (<I>) {
-      print C "$_ unknown";
+      print C "$_ unknown $host";
    }
    close I;
    open (I, "find -L /opt/di/system/jboss -type f -mtime -1 -name '*.log' -print | grep -v 2012 |");
    while (<I>) {
-      print C "$_ unknown";
+      print C "$_ unknown $host";
    }
    close I;
    close C;
@@ -228,17 +229,19 @@ if (! -e $conf) {
 open (I, $conf); 
 while (<I>) {
     chomp;
-    ($filename,$product) = split(" ",$_);
+    ($filename,$product,$sendhost) = split(" ",$_);
     if ($product eq '') {$product = "unknown";}
+    if ($sendhost eq '') {$product = $host;}
     push(@files, File::Tail->new(name=>"$filename",debug=>($debug &256),ignore_nonexistant=>TRUE));
     push(@names, $product);
+    push(@hostnames, $sendhost);
 }
 close I;
 
 my $rin='';
 $interval = 5 * 60; # 5 minutes
 $sent=0; $sentbytes=0; $sentmaxlength=0; $nextreport = time + $interval;
-sendlog("status","finished init, configured to watch ".($#files+1)." logfiles, starting processing of logs");
+sendlog("status",$host,"finished init, configured to watch ".($#files+1)." logfiles, starting processing of logs");
 
     while ($continue) {
 	$nfound=File::Tail::select(undef,undef,undef,60,@files);
@@ -266,7 +269,7 @@ sendlog("status","finished init, configured to watch ".($#files+1)." logfiles, s
                 } else {
 	            # if there is a prior line send it
 		    if ($pending[$i] ne "") {
-		        sendlog($product, $filename.': '.$pending[$i]);
+		        sendlog($product,$hostnames[$i], $filename.': '.$pending[$i]);
                         $sent++;
 		        $sentbytes += length($pending[$i]);
 		        if (length($pending[$i]) > $sentmaxlength) { $sentmaxlength = length($pending[$i]); }
@@ -279,7 +282,7 @@ sendlog("status","finished init, configured to watch ".($#files+1)." logfiles, s
                 # without this the last line of a log will never get sent.
                 # With this it waits one timeout, then gets sent.
 
-	        sendlog($product, $filename.': '.$pending[$i]);
+	        sendlog($product,$hostnames[$i], $filename.': '.$pending[$i]);
                 $sent++;
 	        $sentbytes += length($pending[$i]);
 		if (length($pending[$i]) > $sentmaxlength) { $sentmaxlength = length($pending[$i]); }
@@ -288,12 +291,12 @@ sendlog("status","finished init, configured to watch ".($#files+1)." logfiles, s
 
 	}
         if (time > $nextreport) { 
-           sendlog("status","sent lines=$sent bytes=$sentbytes maxlength=$sentmaxlength");
+           sendlog("status",$host,"sent lines=$sent bytes=$sentbytes maxlength=$sentmaxlength");
            $sent=0; $sentbytes=0; $sentmaxlength=0; $nextreport += $interval;
         }
         $mynewtimestamp = ctime(stat($loglogname)->mtime);
         if ($mynewtimestamp ne $mytimestamp) { # Modified! die, and watchdog will restart
-           sendlog("status", "program updated, aborting");
+           sendlog("status", $host,"program updated, aborting");
            exit;
         }
     }
@@ -305,6 +308,7 @@ sub sendlog {
         Proto    => 'udp'
     ) or die "Socket could not be created : $!\n";
     my $product   = shift;
+    my $sendhost  = shift;
     my $msg   = shift || "NO MESSAGE";
     if ($debug &1) {print "sending log for $product $msg\n";}
 
@@ -347,13 +351,13 @@ sub sendlog {
     push @messages, $msg;
     if ($debug & 4) {print $#messages, " parts in this message\n";}
     if ($#messages == 0) {
-	$message = "<$d>$ts $host loglog-${product}[$pid]: $messages[0]";
+	$message = "<$d>$ts $sendhost loglog-${product}[$pid]: $messages[0]";
         if ($debug &4) {print  "sending single",$message,"\n";}
         print $sock $message;
     } else {
         if ($debug &4) {print "multipart message $j $#messages\n";}
         for ($j=0; $j<=$#messages; $j++){
-            $message = "<$d>$ts $host loglog-${product}[$pid]: (".($j+1).'/'.($#messages+1)."): $messages[$j]";
+            $message = "<$d>$ts $sendhost loglog-${product}[$pid]: (".($j+1).'/'.($#messages+1)."): $messages[$j]";
             if ($debug &4) {print  "sending multipart $j ",$message,"\n";}
             print $sock $message;
         }
